@@ -1,4 +1,5 @@
-import praw
+import os
+import openai
 from transformers import pipeline
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -7,7 +8,19 @@ from wordcloud import WordCloud
 import plotly.express as px
 import streamlit as st
 from datetime import datetime
-import sqlite3
+
+import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Debugging info
+print(f"OPENAI_API_KEY from env: {os.getenv('OPENAI_API_KEY')}")
+
+
+
+
+
 
 # Inject CSS for smaller row height
 st.markdown(
@@ -21,42 +34,88 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Load pre-trained RoBERTa sentiment analysis pipeline
-sentiment_pipeline = pipeline("sentiment-analysis", model="siebert/sentiment-roberta-large-english")
+# Set OpenAI API Key
+api_key = os.getenv("OPENAI_API_KEY")
+print(f"Current API Key: {api_key}")
+
+if not api_key:
+    st.error("OpenAI API Key not found in environment variables")
+    client = None
+else:
+    client = openai.OpenAI(
+        api_key=api_key,
+        organization=os.getenv("OPENAI_ORG_ID", None)  # Optional: Add if you have a specific org ID
+    )
+
+def generate_summary(text):
+    """Generate a summary using OpenAI GPT."""
+    if not client:
+        return "OpenAI client not initialized - check API key"
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are an assistant summarizing Reddit sentiment data."},
+                {"role": "user", "content": f"Summarize the following data:\n{text[:3000]}"}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        st.error(f"OpenAI API Error: {str(e)}")
+        return "Error generating summary"
+
+from transformers import pipeline
+
+@st.cache_resource  # Streamlit caching for models
+def load_sentiment_pipeline():
+    return pipeline("sentiment-analysis", model="siebert/sentiment-roberta-large-english")
+
+sentiment_pipeline = load_sentiment_pipeline()
 
 @st.cache_data
 def analyze_sentiment(text):
     """Analyze sentiment using RoBERTa."""
-    result = sentiment_pipeline(text, truncation=True, max_length=512)
-    return result[0]  # Extract label and score
+    try:
+        result = sentiment_pipeline(text, truncation=True, max_length=512)
+        return result[0]
+    except Exception as e:
+        st.warning(f"Error analyzing sentiment: {e}")
+        return {"label": "Neutral", "score": 0.0}
 
 @st.cache_data
 def fetch_reddit_data(subreddits, limit=100):
     """Fetch Reddit posts and analyze sentiment."""
-    reddit = praw.Reddit(
-        client_id="ddbBQCCdIOytuCRI45Ejiw",
-        client_secret="eQX87HpmlpUZ-vu0ZOztK8p9wN1wTw",
-        user_agent="sentiment"
-    )
-    data = []
+    try:
+        import praw
+        reddit = praw.Reddit(
+            client_id=os.getenv("REDDIT_CLIENT_ID"),
+            client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
+            user_agent=os.getenv("REDDIT_USER_AGENT")
+        )
+        data = []
+        for subreddit in subreddits:
+            st.write(f"Fetching posts from r/{subreddit}...")
+            posts = reddit.subreddit(subreddit).hot(limit=limit)
+            for post in posts:
+                sentiment = analyze_sentiment(post.title)
+                data.append({
+                    'subreddit': subreddit,
+                    'title': post.title,
+                    'score': post.score,
+                    'num_comments': post.num_comments,
+                    'created': datetime.utcfromtimestamp(post.created_utc),
+                    'sentiment_label': sentiment['label'],
+                    'sentiment_score': sentiment['score'],
+                    'permalink': f"https://www.reddit.com{post.permalink}"
+                })
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.error(f"Reddit API Error: {e}")
+        return pd.DataFrame()
 
-    for subreddit in subreddits:
-        st.write(f"Fetching posts from r/{subreddit}...")
-        posts = reddit.subreddit(subreddit).hot(limit=limit)
-        for post in posts:
-            sentiment = analyze_sentiment(post.title)
-            data.append({
-                'subreddit': subreddit,
-                'title': post.title,
-                'score': post.score,
-                'num_comments': post.num_comments,
-                'created': datetime.utcfromtimestamp(post.created_utc),
-                'sentiment_label': sentiment['label'],  # Positive/Negative/Neutral
-                'sentiment_score': sentiment['score'],  # Confidence score
-                'permalink': f"https://www.reddit.com{post.permalink}"
-            })
-
-    return pd.DataFrame(data)
+# Add API key status check
+st.sidebar.write(f"OpenAI API Key set: {'OPENAI_API_KEY' in os.environ}")
 
 # Streamlit Sidebar Filters
 st.sidebar.header("Filters")
@@ -75,7 +134,7 @@ if not data.empty:
     st.session_state["data"] = data
 
     # Add Rolling Average
-    data['rolling_sentiment'] = data.groupby('subreddit')['sentiment_score'].transform(lambda x: x.rolling(rolling_window).mean())
+    data['rolling_sentiment'] = data.groupby('subreddit')['sentiment_score'].transform(lambda x: x.rolling(rolling_window, min_periods=1).mean())
 
     # Word Cloud for Titles
     st.header("Word Cloud for Post Titles")
@@ -97,22 +156,11 @@ if not data.empty:
 
     # Rolling Sentiment Trend with Plotly
     st.header("Rolling Sentiment Trend")
-
-    # Ensure datetime conversion
     data['created'] = pd.to_datetime(data['created'])
-
-    # Select only numeric columns for aggregation
     numeric_columns = data.select_dtypes(include=['number']).columns
     aggregated_data = data.groupby(
         [pd.Grouper(key='created', freq='1H'), 'subreddit']
     )[numeric_columns].mean().reset_index()
-
-    # Recalculate rolling sentiment after aggregation
-    aggregated_data['rolling_sentiment'] = aggregated_data.groupby('subreddit')['sentiment_score'].transform(
-        lambda x: x.rolling(rolling_window, min_periods=1).mean()
-    )
-
-    # Plot with Plotly
     fig = px.line(
         aggregated_data,
         x='created',
@@ -144,6 +192,16 @@ if not data.empty:
     st.write(f"Title: {most_negative['title']}")
     st.write(f"Score: {most_negative['sentiment_score']}")
     st.write(f"[Go to post]({most_negative['permalink']})")
+
+    # AI Summary
+    st.header("AI Summary")
+    text_to_summarize = " ".join(data['title'].tolist())
+    if text_to_summarize:
+        try:
+            summary = generate_summary(text_to_summarize)
+            st.write("**AI-Generated Summary:**", summary)
+        except Exception as e:
+            st.error(f"Error generating summary: {str(e)}")
 
     # Raw Data
     st.header("Raw Data")

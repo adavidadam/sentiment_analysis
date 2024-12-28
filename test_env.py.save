@@ -1,0 +1,12 @@
+T_CLIENT_SECRET"))
+print("User Agent:", os.getenv("REDDIT_USER_AGENT"))
+
+python3 test_env.py
+
+
+import os
+
+print("Client ID:", os.getenv("REDDIT_CLIENT_ID"))
+print("Client Secret:", os.getenv("REDDIT_CLIENT_SECRET"))
+print("User Agent:", os.getenv("REDDIT_USER_AGENT"))
+
